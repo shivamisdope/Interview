@@ -20,11 +20,8 @@ class Dispatcher:
         """Deliver the events that are due now. Returns how many were picked up."""
         events = self.store.fetch_due(self.clock.now(), self.batch_size)
         self.store.mark_in_progress([e.id for e in events])
-        try:
-            for event in events:
-                self._deliver(event)
-        except RequestTimeout as exc:
-            log.warning("delivery failed: %s", exc)
+        for event in events:
+            self._deliver(event)
         return len(events)
 
     def _deliver(self, event: Event) -> None:
@@ -38,7 +35,13 @@ class Dispatcher:
         event.attempts += 1
         now = self.clock.now()
         body = json.dumps(event.payload)
-        response = self.http.send(subscription.url, body, self._headers(event, now))
+        try:
+            response = self.http.send(subscription.url, body, self._headers(event, now))
+        except RequestTimeout as exc:
+            log.warning("delivery failed: %s", exc)
+            self.store.record_attempt(DeliveryAttempt(event.id, event.attempts, now, error="timeout"))
+            self._retry_or_fail(event, now, "timeout")
+            return
         self.store.record_attempt(
             DeliveryAttempt(event.id, event.attempts, now, status_code=response.status_code)
         )
@@ -46,13 +49,17 @@ class Dispatcher:
         if 200 <= response.status_code < 300:
             event.status = "delivered"
             event.last_error = None
-        elif self.retry_policy.should_retry(event.attempts):
+            self.store.save_event(event)
+        else:
+            self._retry_or_fail(event, now, f"HTTP {response.status_code}")
+
+    def _retry_or_fail(self, event: Event, now: float, error: str) -> None:
+        if self.retry_policy.should_retry(event.attempts):
             event.status = "pending"
             event.next_attempt_at = now + self.retry_policy.next_delay(event.attempts)
-            event.last_error = f"HTTP {response.status_code}"
         else:
             event.status = "failed"
-            event.last_error = f"HTTP {response.status_code}"
+        event.last_error = error
         self.store.save_event(event)
 
     def _headers(self, event: Event, now: float) -> dict[str, str]:

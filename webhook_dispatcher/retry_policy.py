@@ -9,7 +9,7 @@ class RetryPolicy:
     max_delay: float = 3600.0
 
     def should_retry(self, attempts_made: int) -> bool:
-        return attempts_made <= self.max_attempts
+        return attempts_made < self.max_attempts
 
     def next_delay(self, attempts_made: int) -> float:
         delay = self.base_delay * self.multiplier ** (attempts_made - 1)
